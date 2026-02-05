@@ -1,0 +1,12 @@
+output/
+*.log
+*.log.*
+__pycache__/
+*.pyc
+venv_oe/
+venvs/
+oe_token_cache.json
+oe_env.sh
+oe_pg_env.sh
+*.zip
+*.bak_*
