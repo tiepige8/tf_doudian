@@ -15,12 +15,16 @@ if [[ -z "${JOB_NAME}" || $# -lt 1 ]]; then
 fi
 
 # Auto-load env (best-effort)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 if [[ -f "./oe_env.sh" ]]; then
   # shellcheck disable=SC1091
   source "./oe_env.sh"
-elif [[ -f "/root/oe_env.sh" ]]; then
+elif [[ -f "${SCRIPT_DIR}/oe_env.sh" ]]; then
   # shellcheck disable=SC1091
-  source "/root/oe_env.sh"
+  source "${SCRIPT_DIR}/oe_env.sh"
+elif [[ -f "${OE_ENV_FILE:-/etc/tf_doudian/oe_env.sh}" ]]; then
+  # shellcheck disable=SC1090
+  source "${OE_ENV_FILE:-/etc/tf_doudian/oe_env.sh}"
 fi
 
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"

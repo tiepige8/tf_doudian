@@ -16,7 +16,7 @@ die() { log "ERROR: $*"; exit 1; }
 require_env() {
   local k="$1"
   if [[ -z "${!k:-}" ]]; then
-    die "missing env var: ${k} (check /root/oe_env.sh)"
+    die "missing env var: ${k} (check ${ENV_FILE})"
   fi
 }
 
@@ -26,17 +26,35 @@ mask() {
   echo "***"
 }
 
-ROOT="/root"
-ENV_FILE="${ROOT}/oe_env.sh"
-VENV_PY="${ROOT}/venv_oe/bin/python"
-ACCOUNTS_PY="${ROOT}/oe_qianchuan_accounts.py"
-LOADER_PY="${ROOT}/oe_pg_loader.py"
-RULES_PY="${ROOT}/oe_monitor_rules.py"
-OUT_JSON="${ROOT}/output/latest.json"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+APP_ROOT_DEFAULT="${SCRIPT_DIR}"
+ENV_FILE="${OE_ENV_FILE:-/etc/tf_doudian/oe_env.sh}"
+if [[ ! -f "${ENV_FILE}" && -f "${APP_ROOT_DEFAULT}/oe_env.sh" ]]; then
+  ENV_FILE="${APP_ROOT_DEFAULT}/oe_env.sh"
+fi
 
 [[ -f "$ENV_FILE" ]] || die "env file not found: $ENV_FILE"
 # shellcheck disable=SC1090
 source "$ENV_FILE"
+
+APP_ROOT="${APP_ROOT:-${APP_ROOT_DEFAULT}}"
+VENV_PY="${PYTHON_BIN:-${APP_ROOT}/venv_oe/bin/python}"
+ACCOUNTS_PY="${APP_ROOT}/oe_qianchuan_accounts.py"
+LOADER_PY="${APP_ROOT}/oe_pg_loader.py"
+RULES_PY="${APP_ROOT}/oe_monitor_rules.py"
+OUT_DIR="${OE_OUTPUT_DIR:-${APP_ROOT}/output}"
+OUT_JSON="${OUT_DIR}/latest.json"
+
+[[ -x "${VENV_PY}" ]] || die "python not found: ${VENV_PY} (set PYTHON_BIN)"
+[[ -f "${ACCOUNTS_PY}" ]] || die "missing file: ${ACCOUNTS_PY}"
+[[ -f "${LOADER_PY}" ]] || die "missing file: ${LOADER_PY}"
+[[ -f "${RULES_PY}" ]] || die "missing file: ${RULES_PY}"
+mkdir -p "${OUT_DIR}"
+
+if [[ -z "${OE_TOKEN_FILE:-}" && -n "${OE_TOKEN_CACHE:-}" ]]; then
+  export OE_TOKEN_FILE="${OE_TOKEN_CACHE}"
+fi
+export OE_OUTPUT_DIR="${OUT_DIR}"
 
 # 基础环境检查（避免 cron 环境缺变量）
 require_env OE_APP_ID
@@ -47,12 +65,13 @@ require_env PGDATABASE
 require_env PGUSER
 require_env PGPASSWORD
 
-cd "$ROOT"
+cd "$APP_ROOT"
 
 # 增加随机抖动，降低系统级限流碰撞概率
 sleep $((RANDOM % 90))
 
 log "START"
+log "PATH: APP_ROOT=${APP_ROOT} ENV_FILE=${ENV_FILE} OUT_DIR=${OUT_DIR}"
 log "ENV: PGHOST=${PGHOST} PGPORT=${PGPORT} PGDATABASE=${PGDATABASE} PGUSER=${PGUSER} PGPASSWORD=$(mask "${PGPASSWORD}") PGSSLMODE=${PGSSLMODE:-} FEISHU_WEBHOOK_URL=$(mask "${FEISHU_WEBHOOK_URL:-}")"
 log "BIN: VENV_PY=${VENV_PY}"
 
