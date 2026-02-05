@@ -141,7 +141,7 @@ def build_balance_daily_card(
       - clean table (column_set) with numeric columns right-aligned
     """
     # Column weights
-    w_name, w_bal, w_yc, w_c7, w_days, w_ratio = 6, 3, 3, 3, 2, 2
+    w_name, w_id, w_bal, w_yc, w_days, w_level = 4, 6, 5, 5, 3, 2
 
     def mk_col(content: str, weight: int, *, bold: bool = False, align: str = "left") -> Dict[str, Any]:
         # Single-line cells keep row heights consistent.
@@ -163,11 +163,11 @@ def build_balance_daily_card(
     # Header row
     header_cols = [
         mk_col("账户", w_name, bold=True, align="left"),
-        mk_col("余额", w_bal, bold=True, align="right"),
-        mk_col("昨日消耗", w_yc, bold=True, align="right"),
-        mk_col("7日消耗", w_c7, bold=True, align="right"),
-        mk_col("可用天数", w_days, bold=True, align="right"),
-        mk_col("倍率", w_ratio, bold=True, align="right"),
+        mk_col("账户ID", w_id, bold=True, align="left"),
+        mk_col("可用余额(元)", w_bal, bold=True, align="right"),
+        mk_col("昨日消耗(元)", w_yc, bold=True, align="right"),
+        mk_col("可撑天数", w_days, bold=True, align="right"),
+        mk_col("级别", w_level, bold=True, align="center"),
     ]
 
     # Body rows
@@ -177,11 +177,11 @@ def build_balance_daily_card(
             mk_row(
                 [
                     mk_col(str(r.get("name", "")), w_name, align="left"),
+                    mk_col(str(r.get("adv_id", "")), w_id, align="left"),
                     mk_col(str(r.get("balance", "")), w_bal, align="right"),
                     mk_col(str(r.get("y_cost", "")), w_yc, align="right"),
-                    mk_col(str(r.get("cost_7d", "")), w_c7, align="right"),
                     mk_col(str(r.get("days", "")), w_days, align="right"),
-                    mk_col(str(r.get("ratio", "")), w_ratio, align="right"),
+                    mk_col(str(r.get("level", "")), w_level, align="center"),
                 ]
             )
         )
@@ -195,6 +195,17 @@ def build_balance_daily_card(
     elements.append(mk_row(header_cols))
     elements.append({"tag": "hr"})
     elements.extend(body_rows)
+    if len(rows) > max_rows:
+        elements.append({"tag": "hr"})
+        elements.append(
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": f"已展示前 **{max_rows}** 个账户（共 **{len(rows)}** 个）。",
+                },
+            }
+        )
 
     title_color = {"green": "green", "orange": "orange", "red": "red"}.get(header_template, "green")
 
@@ -202,7 +213,7 @@ def build_balance_daily_card(
         "config": {"wide_screen_mode": True},
         "header": {
             "template": title_color,
-            "title": {"tag": "plain_text", "content": f"账户资金日报（{report_date}）"},
+            "title": {"tag": "plain_text", "content": f"投放账户资金日报（{report_date}）"},
         },
         "elements": elements,
     }
@@ -221,6 +232,13 @@ def build_daily_balance_rows(
     def fmt(v: float) -> str:
         return f"{money_to_yuan(v, unit_mult, digits):.{digits}f}"
 
+    def classify(days_left: Optional[float], ratio: float) -> Tuple[str, int]:
+        if ratio < 1.0 or (days_left is not None and days_left < 1.0):
+            return "紧急", 0
+        if ratio < 2.0 or (days_left is not None and days_left < 2.0):
+            return "关注", 1
+        return "正常", 2
+
     rows: List[Dict[str, Any]] = []
     for adv_id in adv_ids_in_report:
         adv_id = int(adv_id)
@@ -231,16 +249,22 @@ def build_daily_balance_rows(
         avg7 = c7 / 7.0 if c7 > 0 else 0.0
         days_left = (bal / avg7) if avg7 > 0 else None
         ratio = (bal / y_cost) if y_cost > 0 else 0.0
+        level, rank = classify(days_left, ratio)
+        days_sort = days_left if days_left is not None else 999999.0
         rows.append(
             {
-                "name": name,
+                "name": _shorten_name(name, 20),
+                "adv_id": str(adv_id),
                 "balance": fmt(bal),
                 "y_cost": fmt(y_cost),
-                "cost_7d": fmt(c7),
-                "days": f"{days_left:.1f}" if days_left is not None else "-",
-                "ratio": f"{ratio:.2f}",
+                "days": f"{days_left:.1f}天" if days_left is not None else "-",
+                "level": level,
+                "_sort": (rank, days_sort, ratio, name),
             }
         )
+    rows.sort(key=lambda x: x.get("_sort", (9, 999999.0, 999999.0, "")))
+    for r in rows:
+        r.pop("_sort", None)
     return rows
 
 
@@ -382,38 +406,55 @@ def build_feishu_text(
     keyword: str,
 ) -> str:
     rule_title = {
-        "RULE_00": "余额预警·日检(00:05)",
-        "RULE_30M": "余额预警·30分钟",
-        "RULE_1H": "余额预警·每小时",
+        "RULE_00": "余额预警（日检）",
+        "RULE_30M": "余额预警（30分钟巡检）",
+        "RULE_1H": "余额预警（小时巡检）",
     }.get(rule_id, rule_id)
+    rule_action = {
+        "RULE_00": "建议：优先处理下列风险账户，避免次日投放受限。",
+        "RULE_30M": "建议：优先给下列风险账户补款，避免广告中断。",
+        "RULE_1H": "建议：优先处理近1小时消耗较快的风险账户。",
+    }.get(rule_id, "建议：请尽快处理风险账户。")
 
-    hdr = [
-        f"【{rule_title}】触发 {len(alerts)} 个账户",
-        f"时间: {now_cn.strftime('%Y-%m-%d %H:%M:%S')} (Asia/Shanghai)",
-        "说明: 余额/消耗单位已换算为‘元’。",
+    sev_map = {"crit": "高", "warn": "中", "info": "低"}
+    header_lines = [
+        f"【{rule_title}】",
+        f"巡检时间：{now_cn.strftime('%Y-%m-%d %H:%M:%S')}（Asia/Shanghai）",
+        f"结论：本次发现 {len(alerts)} 个需要关注的账户。",
+        rule_action,
         "",
+        "请优先处理以下账户：",
     ]
 
-    lines = []
+    detail_lines: List[str] = []
     shown = alerts[: max_items]
     for i, a in enumerate(shown, start=1):
         adv_id = int(a["advertiser_id"])
-        name = name_map.get(adv_id) or "(无名称)"
+        name = (name_map.get(adv_id) or "(无名称)").strip()
         bal = money_to_yuan(a["balance_valid"], unit_mult, digits)
         base = money_to_yuan(a["baseline_spend"], unit_mult, digits)
         thr = money_to_yuan(a["threshold"], unit_mult, digits)
-        ratio = a.get("ratio", 0.0)
+        ratio = float(a.get("ratio", 0.0) or 0.0)
         snap_ts = a.get("snapshot_ts")
-        snap_s = snap_ts.strftime('%m-%d %H:%M:%S') if isinstance(snap_ts, datetime) else ""
-        sev = a.get("severity", "")
-        lines.append(
-            f"{i}. {name} | {adv_id} | 严重度={sev} | 可用余额={bal}元 | 基准消耗={base}元 | 阈值={thr}元 | 倍数={ratio:.2f} | 快照={snap_s}"
+        snap_s = snap_ts.strftime('%m-%d %H:%M:%S') if isinstance(snap_ts, datetime) else "-"
+        sev = sev_map.get(str(a.get("severity", "")).lower(), "中")
+        detail_lines.extend(
+            [
+                f"{i}. {name}",
+                f"   账户ID：{adv_id}",
+                f"   风险等级：{sev}",
+                f"   当前可用余额：{bal:.{digits}f} 元",
+                f"   参考消耗：{base:.{digits}f} 元（预警线 {thr:.{digits}f} 元）",
+                f"   覆盖倍数：{ratio:.2f}（< 1 表示余额低于参考消耗）",
+                f"   数据快照：{snap_s}",
+                "",
+            ]
         )
 
     if len(alerts) > len(shown):
-        lines.append(f"... 还有 {len(alerts) - len(shown)} 个账户未展示(为避免刷屏)。")
+        detail_lines.append(f"（另有 {len(alerts) - len(shown)} 个账户未展示，已省略）")
 
-    text = "\n".join(hdr + lines)
+    text = "\n".join(header_lines + detail_lines).rstrip()
     if keyword:
         # If the bot enables “关键词” protection, the keyword must appear in the message.
         text = f"{keyword}\n" + text
@@ -653,23 +694,38 @@ def main():
                                 digits=args.digits,
                             )
                             status_lines: List[str] = []
+                            status_lines.append(f"**日报日期**：{str(y)}（昨日）")
+                            status_lines.append(f"**覆盖账户**：{len(adv_ids_in_report)} 个（昨日有消耗）")
                             if alerted_ids:
-                                status_lines.append(f"【余额预警·每日】⚠️ 触发 {len(alerted_ids)} 个账户：余额 < 昨日消耗 × 2")
-                                for adv_id in alerted_ids[:20]:
+                                status_lines.append(f"**预警结果**：⚠️ 触发 {len(alerted_ids)} 个账户（余额 < 昨日消耗 × 2）")
+                                status_lines.append("**触发账户明细**：")
+                                alert_rows: List[Tuple[float, float, int, str]] = []
+                                for adv_id in alerted_ids:
                                     adv_id = int(adv_id)
                                     nm = name_map_r.get(adv_id, str(adv_id))
                                     bal_v = float(balance_map.get(adv_id, 0.0))
                                     yc_v = float(y_cost.get(adv_id, 0.0))
                                     ratio_v = (bal_v / yc_v) if yc_v > 0 else 0.0
+                                    c7_v = float(cost7.get(adv_id, 0.0))
+                                    avg7_v = c7_v / 7.0 if c7_v > 0 else 0.0
+                                    days_left_v = (bal_v / avg7_v) if avg7_v > 0 else None
+                                    days_sort_v = days_left_v if days_left_v is not None else 999999.0
+                                    alert_rows.append((ratio_v, days_sort_v, adv_id, nm))
+
+                                for ratio_v, _, adv_id, nm in sorted(alert_rows, key=lambda x: (x[0], x[1])):
+                                    bal_v = float(balance_map.get(adv_id, 0.0))
+                                    yc_v = float(y_cost.get(adv_id, 0.0))
+                                    c7_v = float(cost7.get(adv_id, 0.0))
+                                    avg7_v = c7_v / 7.0 if c7_v > 0 else 0.0
+                                    days_left_v = (bal_v / avg7_v) if avg7_v > 0 else None
+                                    days_s_v = f"{days_left_v:.1f}天" if days_left_v is not None else "-"
                                     status_lines.append(
-                                        f"- {nm}｜余额 {fmt_money(bal_v, args.unit_mult, args.digits)}｜昨日消耗 {fmt_money(yc_v, args.unit_mult, args.digits)}｜倍率 {ratio_v:.2f}"
+                                        f"- {_shorten_name(nm, 24)}（ID: {adv_id}）：余额 {fmt_money(bal_v, args.unit_mult, args.digits)} 元，昨消 {fmt_money(yc_v, args.unit_mult, args.digits)} 元，可撑 {days_s_v}"
                                     )
                             else:
-                                status_lines.append("【余额预警·每日】✅ 余额充足，未触发预警")
-
-                            status_lines.append("--------------------")
-                            status_lines.append(f"【账户资金日报】日期: {str(y)} (昨日)")
-                            status_lines.append("字段：余额｜昨日消耗｜7日消耗｜可用天数(余额/7日均消)｜倍率(余额/昨日)")
+                                status_lines.append("**预警结果**：✅ 未触发预警")
+                            status_lines.append("")
+                            status_lines.append("说明：下方表格已按风险优先级排序（紧急 -> 关注 -> 正常）。")
                             status_md = "\n".join(status_lines)
 
                             card = build_balance_daily_card(
