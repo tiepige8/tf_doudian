@@ -16,7 +16,7 @@ die() { log "ERROR: $*"; exit 1; }
 require_env() {
   local k="$1"
   if [[ -z "${!k:-}" ]]; then
-    die "missing env var: ${k} (check /root/oe_env.sh)"
+    die "missing env var: ${k} (check ${ENV_FILE})"
   fi
 }
 
@@ -26,14 +26,23 @@ mask() {
   echo "***"
 }
 
-ROOT="/root"
-ENV_FILE="${ROOT}/oe_env.sh"
-VENV_PY="${ROOT}/venv_oe/bin/python"
-RULES_PY="${ROOT}/oe_monitor_rules.py"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+APP_ROOT_DEFAULT="${SCRIPT_DIR}"
+ENV_FILE="${OE_ENV_FILE:-/etc/tf_doudian/oe_env.sh}"
+if [[ ! -f "${ENV_FILE}" && -f "${APP_ROOT_DEFAULT}/oe_env.sh" ]]; then
+  ENV_FILE="${APP_ROOT_DEFAULT}/oe_env.sh"
+fi
 
 [[ -f "$ENV_FILE" ]] || die "env file not found: $ENV_FILE"
 # shellcheck disable=SC1090
 source "$ENV_FILE"
+
+APP_ROOT="${APP_ROOT:-${APP_ROOT_DEFAULT}}"
+VENV_PY="${PYTHON_BIN:-${APP_ROOT}/venv_oe/bin/python}"
+RULES_PY="${APP_ROOT}/oe_monitor_rules.py"
+
+[[ -x "${VENV_PY}" ]] || die "python not found: ${VENV_PY} (set PYTHON_BIN)"
+[[ -f "${RULES_PY}" ]] || die "missing file: ${RULES_PY}"
 
 require_env PGHOST
 require_env PGPORT
@@ -41,9 +50,10 @@ require_env PGDATABASE
 require_env PGUSER
 require_env PGPASSWORD
 
-cd "$ROOT"
+cd "$APP_ROOT"
 
 log "START"
+log "PATH: APP_ROOT=${APP_ROOT} ENV_FILE=${ENV_FILE}"
 log "ENV: PGHOST=${PGHOST} PGPORT=${PGPORT} PGDATABASE=${PGDATABASE} PGUSER=${PGUSER} PGPASSWORD=$(mask "${PGPASSWORD}") PGSSLMODE=${PGSSLMODE:-} FEISHU_WEBHOOK_URL=$(mask "${FEISHU_WEBHOOK_URL:-}")"
 log "BIN: VENV_PY=${VENV_PY}"
 
