@@ -10,3 +10,4 @@ oe_env.sh
 oe_pg_env.sh
 *.zip
 *.bak_*
+.DS_Store
