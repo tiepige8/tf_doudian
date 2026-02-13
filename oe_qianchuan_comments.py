@@ -43,6 +43,30 @@ import psycopg2.extras
 
 
 TZ_CN = timezone(timedelta(hours=8))
+OE_NO_PERMISSION_CODE = 40002
+
+
+class OeApiError(RuntimeError):
+    """Structured OceanEngine API error with parsed code for caller handling."""
+
+    def __init__(
+        self,
+        api_name: str,
+        code: Optional[int],
+        msg: str,
+        help_msg: str = "",
+        request_id: str = "",
+        resp: Optional[Dict[str, Any]] = None,
+    ):
+        self.api_name = api_name
+        self.code = code
+        self.msg = msg
+        self.help_msg = help_msg
+        self.request_id = request_id
+        self.resp = resp or {}
+        super().__init__(
+            f"[{api_name}] API失败 code={code}, msg={msg}, help={help_msg}, request_id={request_id}, resp={self.resp}"
+        )
 
 
 def _safe_bigint(x):
@@ -244,7 +268,19 @@ def oe_check_ok(resp_json: Dict[str, Any], api_name: str) -> Dict[str, Any]:
     msg = resp_json.get("message") or resp_json.get("msg") or ""
     help_msg = resp_json.get("help_message") or resp_json.get("help") or ""
     request_id = resp_json.get("request_id") or ""
-    raise RuntimeError(f"[{api_name}] API失败 code={code}, msg={msg}, help={help_msg}, request_id={request_id}, resp={resp_json}")
+    parsed_code: Optional[int]
+    try:
+        parsed_code = int(code)
+    except Exception:
+        parsed_code = None
+    raise OeApiError(
+        api_name=api_name,
+        code=parsed_code,
+        msg=str(msg),
+        help_msg=str(help_msg),
+        request_id=str(request_id),
+        resp=resp_json,
+    )
 
 
 def request_json_with_retry(
@@ -275,10 +311,15 @@ def request_json_with_retry(
             except Exception:
                 raise RuntimeError(f"[{api_name}] 非JSON响应 status={r.status_code} text={r.text[:200]}")
 
-            if (j.get("code") in (0, "0")):
+            if j.get("code") in (0, "0"):
                 return j
 
-            code = int(j.get("code") or -1)
+            code_raw = j.get("code")
+            try:
+                code = int(code_raw)
+            except Exception:
+                code = -1
+
             if code in retry_codes and attempt < max_attempts:
                 sleep = min(60.0, (0.6 * (2 ** (attempt - 1))) + random.random() * 0.8)
                 log("WARNING", f"请求失败，重试 api={api_name} attempt={attempt}/{max_attempts} sleep={sleep:.1f}s code={code} msg={j.get('message') or j.get('msg')}")
@@ -288,6 +329,10 @@ def request_json_with_retry(
             # not retryable or maxed
             oe_check_ok(j, api_name)
             return j
+        except OeApiError as e:
+            # OeApiError has already been retried when code is in retry_codes above.
+            last_err = e
+            break
         except Exception as e:
             last_err = e
             if attempt >= max_attempts:
@@ -296,6 +341,8 @@ def request_json_with_retry(
             log("WARNING", f"请求异常，重试 api={api_name} attempt={attempt}/{max_attempts} sleep={sleep:.1f}s err={e!r}")
             time.sleep(sleep)
 
+    if isinstance(last_err, OeApiError):
+        raise last_err
     raise RuntimeError(f"[{api_name}] 请求最终失败：{last_err!r}")
 
 
@@ -565,6 +612,10 @@ def build_notify_text(rows: List[Dict[str, Any]], window_hours: int) -> str:
     lines.append(f"【千川负向评论已隐藏汇总】{now_str}")
     lines.append(f"统计窗口：最近 {window_hours} 小时；本次新增隐藏：{total} 条")
     lines.append("")
+    if total == 0:
+        lines.append("本次无新增隐藏记录。")
+        return "\n".join(lines)
+
     # show top 10 advertisers
     for adv_name, lst in sorted(groups.items(), key=lambda kv: len(kv[1]), reverse=True)[:10]:
         lines.append(f"- {adv_name}：{len(lst)} 条")
@@ -605,6 +656,7 @@ def run_once(lookback_days: int, page_size: int, sleep_between_adv: float):
     total_upsert = 0
     total_hide_success = 0
     total_hide_fail = 0
+    skipped_no_permission = 0
     try:
         with conn.cursor() as cur:
             advertiser_ids = get_advertisers(cur)
@@ -616,30 +668,37 @@ def run_once(lookback_days: int, page_size: int, sleep_between_adv: float):
 
                 page = 1
                 max_pages = max(1, int(10000 / page_size))
-                while page <= max_pages:
-                    j = api_get_comments(access_token, adv_id, start_d, end_d, page, page_size, hide_status="NOT_HIDE")
-                    data = (j.get("data") or {})
-                    clist = data.get("comment_list") or []
-                    if not clist:
-                        break
+                try:
+                    while page <= max_pages:
+                        j = api_get_comments(access_token, adv_id, start_d, end_d, page, page_size, hide_status="NOT_HIDE")
+                        data = (j.get("data") or {})
+                        clist = data.get("comment_list") or []
+                        if not clist:
+                            break
 
-                    for c in clist:
-                        if isinstance(c, dict):
-                            c["advertiser_id"] = adv_id
-                            fetched.append(c)
-                            if (c.get("emotion_type") == "NEGATIVE") and (c.get("hide_status") != "HIDE"):
-                                try:
-                                    to_hide.append(int(c.get("comment_id")))
-                                except Exception:
-                                    pass
+                        for c in clist:
+                            if isinstance(c, dict):
+                                c["advertiser_id"] = adv_id
+                                fetched.append(c)
+                                if (c.get("emotion_type") == "NEGATIVE") and (c.get("hide_status") != "HIDE"):
+                                    try:
+                                        to_hide.append(int(c.get("comment_id")))
+                                    except Exception:
+                                        pass
 
-                    # next page?
-                    if len(clist) < page_size:
-                        break
-                    page += 1
+                        # next page?
+                        if len(clist) < page_size:
+                            break
+                        page += 1
 
-                    # gentle sleep to avoid system-wide throttle
-                    time.sleep(0.15 + random.random() * 0.2)
+                        # gentle sleep to avoid system-wide throttle
+                        time.sleep(0.15 + random.random() * 0.2)
+                except OeApiError as e:
+                    if e.code == OE_NO_PERMISSION_CODE:
+                        skipped_no_permission += 1
+                        log("WARNING", f"跳过无权限账户 advertiser_id={adv_id} code={e.code} request_id={e.request_id}")
+                        continue
+                    raise
 
                 # upsert into DB
                 total_upsert += upsert_comments(cur, fetched, now_cn)
@@ -685,7 +744,7 @@ def run_once(lookback_days: int, page_size: int, sleep_between_adv: float):
                     time.sleep(sleep_between_adv)
 
         conn.commit()
-        log("INFO", f"DONE upsert={total_upsert} hide_ok={total_hide_success} hide_fail={total_hide_fail}")
+        log("INFO", f"DONE upsert={total_upsert} hide_ok={total_hide_success} hide_fail={total_hide_fail} skip_no_permission={skipped_no_permission}")
     except Exception:
         conn.rollback()
         raise
@@ -700,11 +759,6 @@ def run_notify(window_hours: int):
     try:
         with conn.cursor() as cur:
             rows = select_unnotified_hides(cur, since_hours=window_hours)
-            if not rows:
-                log("INFO", f"notify：没有新增隐藏记录（window={window_hours}h）")
-                conn.rollback()
-                return
-
             text = build_notify_text(rows, window_hours=window_hours)
             feishu_send_text(webhook, text)
 
@@ -732,6 +786,7 @@ def backfill(start_d: date, end_d: date, window_days: int, do_hide: bool, page_s
     total_upsert = 0
     total_hide_success = 0
     total_hide_fail = 0
+    skipped_no_permission = 0
 
     def daterange_chunks(s: date, e: date, days: int) -> List[Tuple[date, date]]:
         chunks = []
@@ -750,30 +805,39 @@ def backfill(start_d: date, end_d: date, window_days: int, do_hide: bool, page_s
             log("INFO", f"backfill：advertisers={len(advertiser_ids)} chunks={len(chunks)} range={start_d}..{end_d} window_days={window_days} do_hide={do_hide}")
 
             for idx, adv_id in enumerate(advertiser_ids, start=1):
+                adv_no_permission = False
                 for (s, e) in chunks:
                     fetched: List[Dict[str, Any]] = []
                     to_hide: List[int] = []
                     page = 1
                     max_pages = max(1, int(10000 / page_size))
-                    while page <= max_pages:
-                        j = api_get_comments(access_token, adv_id, s, e, page, page_size, hide_status="ALL")
-                        data = (j.get("data") or {})
-                        clist = data.get("comment_list") or []
-                        if not clist:
+                    try:
+                        while page <= max_pages:
+                            j = api_get_comments(access_token, adv_id, s, e, page, page_size, hide_status="ALL")
+                            data = (j.get("data") or {})
+                            clist = data.get("comment_list") or []
+                            if not clist:
+                                break
+                            for c in clist:
+                                if isinstance(c, dict):
+                                    c["advertiser_id"] = adv_id
+                                    fetched.append(c)
+                                    if do_hide and (c.get("emotion_type") == "NEGATIVE") and (c.get("hide_status") != "HIDE"):
+                                        try:
+                                            to_hide.append(int(c.get("comment_id")))
+                                        except Exception:
+                                            pass
+                            if len(clist) < page_size:
+                                break
+                            page += 1
+                            time.sleep(0.15 + random.random() * 0.2)
+                    except OeApiError as e2:
+                        if e2.code == OE_NO_PERMISSION_CODE:
+                            skipped_no_permission += 1
+                            adv_no_permission = True
+                            log("WARNING", f"backfill跳过无权限账户 advertiser_id={adv_id} code={e2.code} request_id={e2.request_id}")
                             break
-                        for c in clist:
-                            if isinstance(c, dict):
-                                c["advertiser_id"] = adv_id
-                                fetched.append(c)
-                                if do_hide and (c.get("emotion_type") == "NEGATIVE") and (c.get("hide_status") != "HIDE"):
-                                    try:
-                                        to_hide.append(int(c.get("comment_id")))
-                                    except Exception:
-                                        pass
-                        if len(clist) < page_size:
-                            break
-                        page += 1
-                        time.sleep(0.15 + random.random() * 0.2)
+                        raise
 
                     total_upsert += upsert_comments(cur, fetched, now_cn)
 
@@ -799,14 +863,17 @@ def backfill(start_d: date, end_d: date, window_days: int, do_hide: bool, page_s
                                         upsert_action(cur, adv_id, cid, "hide", "failed", req_id, None, "hide failed", raw={"resp": resp})
                                     total_hide_fail += len(fail_ids)
 
-                            except Exception as e:
+                            except Exception as hide_err:
                                 for cid in batch:
-                                    upsert_action(cur, adv_id, cid, "hide", "failed", None, None, str(e), raw={"error": repr(e)})
+                                    upsert_action(cur, adv_id, cid, "hide", "failed", None, None, str(hide_err), raw={"error": repr(hide_err)})
                                 total_hide_fail += len(batch)
-                                log("WARNING", f"backfill隐藏失败 advertiser_id={adv_id} batch={len(batch)} err={e!r}")
+                                log("WARNING", f"backfill隐藏失败 advertiser_id={adv_id} batch={len(batch)} err={hide_err!r}")
                             time.sleep(0.2 + random.random() * 0.3)
 
                     log("INFO", f"backfill adv={adv_id} window={s}..{e} fetched={len(fetched)} to_hide={len(to_hide) if do_hide else 0}")
+
+                if adv_no_permission:
+                    continue
 
                 if idx % 5 == 0 or idx == len(advertiser_ids):
                     log("INFO", f"backfill 进度：{idx}/{len(advertiser_ids)} upsert={total_upsert} hide_ok={total_hide_success} hide_fail={total_hide_fail}")
@@ -815,7 +882,7 @@ def backfill(start_d: date, end_d: date, window_days: int, do_hide: bool, page_s
                     time.sleep(sleep_between_adv)
 
         conn.commit()
-        log("INFO", f"backfill DONE upsert={total_upsert} hide_ok={total_hide_success} hide_fail={total_hide_fail}")
+        log("INFO", f"backfill DONE upsert={total_upsert} hide_ok={total_hide_success} hide_fail={total_hide_fail} skip_no_permission={skipped_no_permission}")
     except Exception:
         conn.rollback()
         raise
